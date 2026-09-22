@@ -1,6 +1,6 @@
-# a3s-effect
+# effect
 
-`a3s-effect` is the actor runtime for an A3S Code harness. It keeps two
+`effect` is the actor runtime for an A3S Code harness. It keeps two
 ideas separate, and the rest of the crate follows from that split.
 
 A transition is a program value. It names its success, its expected error,

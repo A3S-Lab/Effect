@@ -1,4 +1,4 @@
-use a3s_effect::{
+use effect::{
     answer_fact, coding_actor, component, confirm_fact, cut_log, ingest, message_fact,
     parse_fact_json, Actor, ActorError, CodingPhase, CodingServices, Compactor, Completion,
     CompletionRequest, Effect, Exit, Fact, FileLog, HarnessConfig, LogStore, MemoryLog,
@@ -33,7 +33,7 @@ impl Completion for ScriptModel {
     fn complete(
         &self,
         _request: CompletionRequest,
-    ) -> a3s_effect::coding::BoxFuture<Result<ModelDecision, ActorError>> {
+    ) -> effect::coding::BoxFuture<Result<ModelDecision, ActorError>> {
         let decision = self
             .decisions
             .lock()
@@ -54,7 +54,7 @@ impl ToolRunner for CountingTools {
     fn run(
         &self,
         call: ToolCall,
-    ) -> a3s_effect::coding::BoxFuture<Result<serde_json::Value, ActorError>> {
+    ) -> effect::coding::BoxFuture<Result<serde_json::Value, ActorError>> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         let name = call.name;
         let fail = self.fail_first.load(Ordering::SeqCst) > 0 && n == 0;
@@ -79,7 +79,7 @@ impl Compactor for CountingCompactor {
     fn compact(
         &self,
         messages: &[String],
-    ) -> a3s_effect::coding::BoxFuture<Result<String, ActorError>> {
+    ) -> effect::coding::BoxFuture<Result<String, ActorError>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let summary = messages.join(" ");
         Box::pin(async move { Ok(format!("summary:{summary}")) })
@@ -92,7 +92,7 @@ struct Harness {
     tool_calls: Arc<AtomicUsize>,
     compact_calls: Arc<AtomicUsize>,
     log: MemoryLog,
-    actor: a3s_effect::Actor<CodingServices, a3s_effect::CodingView>,
+    actor: effect::Actor<CodingServices, effect::CodingView>,
     limit: u32,
 }
 
@@ -145,12 +145,8 @@ fn harness(
     }
 }
 
-async fn send(
-    harness: &Harness,
-    key: &str,
-    text: &str,
-) -> a3s_effect::Settlement<a3s_effect::CodingView> {
-    a3s_effect::ingest_coding(
+async fn send(harness: &Harness, key: &str, text: &str) -> effect::Settlement<effect::CodingView> {
+    effect::ingest_coding(
         &harness.actor,
         &harness.log,
         Arc::clone(&harness.services),
@@ -170,7 +166,7 @@ async fn a_text_turn_runs_once_and_resume_does_not_call_the_model_again() {
     assert_eq!(settled.view.phase, CodingPhase::Done);
     assert_eq!(harness.model_calls.load(Ordering::SeqCst), 1);
 
-    let again = a3s_effect::resume_coding(
+    let again = effect::resume_coding(
         &harness.actor,
         &harness.log,
         Arc::clone(&harness.services),
@@ -199,7 +195,7 @@ async fn confirmation_parks_until_a_fact_and_denial_does_not_run_the_tool() {
     );
     assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 0);
 
-    let denied = a3s_effect::ingest_coding(
+    let denied = effect::ingest_coding(
         &harness.actor,
         &harness.log,
         Arc::clone(&harness.services),
@@ -223,7 +219,7 @@ async fn an_approved_tool_runs_once_across_resume() {
         false,
     );
     send(&harness, "m1", "read it").await;
-    let settled = a3s_effect::ingest_coding(
+    let settled = effect::ingest_coding(
         &harness.actor,
         &harness.log,
         Arc::clone(&harness.services),
@@ -235,7 +231,7 @@ async fn an_approved_tool_runs_once_across_resume() {
     .expect("approve");
     assert_eq!(settled.view.assistant.as_deref(), Some("done"));
     assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 1);
-    a3s_effect::resume_coding(
+    effect::resume_coding(
         &harness.actor,
         &harness.log,
         Arc::clone(&harness.services),
@@ -256,7 +252,7 @@ async fn a_failed_tool_is_not_recorded_and_resume_runs_it_once() {
         1,
         true,
     );
-    let failed = a3s_effect::ingest_coding(
+    let failed = effect::ingest_coding(
         &harness.actor,
         &harness.log,
         Arc::clone(&harness.services),
@@ -277,7 +273,7 @@ async fn a_failed_tool_is_not_recorded_and_resume_runs_it_once() {
         .iter()
         .all(|fact| fact.kind != "tool.result"));
 
-    let settled = a3s_effect::resume_coding(
+    let settled = effect::resume_coding(
         &harness.actor,
         &harness.log,
         Arc::clone(&harness.services),
@@ -297,7 +293,7 @@ async fn a_failed_tool_is_not_recorded_and_resume_runs_it_once() {
         1
     );
 
-    a3s_effect::resume_coding(
+    effect::resume_coding(
         &harness.actor,
         &harness.log,
         Arc::clone(&harness.services),
@@ -334,7 +330,7 @@ async fn compaction_runs_once_before_inference() {
         .log
         .iter()
         .any(|fact| fact.kind == "compaction.done"));
-    a3s_effect::resume_coding(
+    effect::resume_coding(
         &harness.actor,
         &harness.log,
         Arc::clone(&harness.services),
@@ -369,7 +365,7 @@ async fn a_question_stays_parked_with_allow_free_text_until_an_answer_fact() {
     assert_eq!(question.question_id, "q1");
     assert_eq!(harness.model_calls.load(Ordering::SeqCst), 1);
 
-    let still = a3s_effect::resume_coding(
+    let still = effect::resume_coding(
         &harness.actor,
         &harness.log,
         Arc::clone(&harness.services),
@@ -381,7 +377,7 @@ async fn a_question_stays_parked_with_allow_free_text_until_an_answer_fact() {
     assert_eq!(still.steps, 0);
     assert_eq!(harness.model_calls.load(Ordering::SeqCst), 1);
 
-    let settled = a3s_effect::ingest_coding(
+    let settled = effect::ingest_coding(
         &harness.actor,
         &harness.log,
         Arc::clone(&harness.services),
@@ -425,7 +421,7 @@ async fn duplicate_transition_keys_fail_before_any_effect_runs() {
             let left_calls = Arc::clone(&left_calls);
             (
                 (),
-                vec![a3s_effect::Transition {
+                vec![effect::Transition {
                     key: "same".into(),
                     run: Effect::from_async(move |_services, _cancel| {
                         let left_calls = Arc::clone(&left_calls);
@@ -449,7 +445,7 @@ async fn duplicate_transition_keys_fail_before_any_effect_runs() {
             let right_calls = Arc::clone(&right_calls);
             (
                 (),
-                vec![a3s_effect::Transition {
+                vec![effect::Transition {
                     key: "same".into(),
                     run: Effect::from_async(move |_services, _cancel| {
                         let right_calls = Arc::clone(&right_calls);
@@ -486,7 +482,7 @@ async fn duplicate_transition_keys_fail_before_any_effect_runs() {
 
 #[tokio::test]
 async fn file_log_recovery_runs_a_recorded_tool_request_once() {
-    let dir = std::env::temp_dir().join(format!("a3s-effect-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("effect-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let log = FileLog::open(&dir).expect("open");
     let tools = Arc::new(CountingTools {
@@ -519,14 +515,14 @@ async fn file_log_recovery_runs_a_recorded_tool_request_once() {
     )
     .unwrap();
 
-    let settled = a3s_effect::resume_coding(&actor, &log, Arc::clone(&services), "recover", 8)
+    let settled = effect::resume_coding(&actor, &log, Arc::clone(&services), "recover", 8)
         .await
         .expect("resume");
     assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
     assert_eq!(settled.view.assistant.as_deref(), Some("after"));
 
     let reopened = FileLog::open(&dir).expect("reopen");
-    a3s_effect::resume_coding(&actor, &reopened, Arc::clone(&services), "recover", 8)
+    effect::resume_coding(&actor, &reopened, Arc::clone(&services), "recover", 8)
         .await
         .expect("second");
     assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
