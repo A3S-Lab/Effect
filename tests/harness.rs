@@ -544,3 +544,72 @@ async fn a_corrupt_log_line_is_a_schema_error() {
     assert_eq!(fact.kind, "user.message");
     assert_eq!(fact.key, "m1");
 }
+
+#[tokio::test]
+async fn infer_fail_invokes_completion_model_attempts_times() {
+    for attempts in [2_u32, 1] {
+        let harness = harness(
+            vec![Err(ActorError::Config("m".into())); attempts as usize],
+            2,
+            10_000,
+            attempts,
+            false,
+        );
+        let error = a3s_effect::ingest_coding(
+            &harness.actor,
+            &harness.log,
+            Arc::clone(&harness.services),
+            "thread-1",
+            message_fact("m1", "hi"),
+            harness.limit,
+        )
+        .await;
+        assert!(matches!(error, Err(Exit::Fail(ActorError::Config(message))) if message == "m"));
+        assert_eq!(
+            harness.model_calls.load(Ordering::SeqCst),
+            attempts as usize
+        );
+        assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 0);
+        let stored = harness.log.read("thread-1").unwrap();
+        assert!(stored.iter().any(|fact| fact.kind == "user.message"));
+        assert!(stored.iter().all(|fact| fact.kind != "model.turn"));
+    }
+}
+
+#[tokio::test]
+async fn a_model_turn_that_is_not_a_decision_settles_done() {
+    let harness = harness(vec![], 2, 10_000, 1, false);
+    harness
+        .log
+        .append("thread-1", &[message_fact("m1", "hi")], None)
+        .unwrap();
+    harness
+        .log
+        .append(
+            "thread-1",
+            &[NewFact {
+                kind: "model.turn".into(),
+                key: "model:1:0".into(),
+                payload: serde_json::json!({ "kind": "nope" }),
+            }],
+            None,
+        )
+        .unwrap();
+    let before = harness.log.read("thread-1").unwrap();
+    let line = serde_json::to_string(before.last().unwrap()).unwrap();
+    parse_fact_json(&line).expect("model.turn is a valid fact line");
+    let settled = a3s_effect::resume_coding(
+        &harness.actor,
+        &harness.log,
+        Arc::clone(&harness.services),
+        "thread-1",
+        harness.limit,
+    )
+    .await
+    .expect("resume");
+    assert_eq!(settled.view.phase, CodingPhase::Done);
+    assert!(settled.view.schema_error.is_some());
+    assert_eq!(harness.model_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(settled.log.len(), before.len());
+}
