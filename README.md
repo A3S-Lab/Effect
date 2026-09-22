@@ -1,5 +1,7 @@
 # effect
 
+[中文](README.zh-CN.md)
+
 `effect` is the actor runtime for an A3S Code harness. It keeps two
 ideas separate, and the rest of the crate follows from that split.
 
@@ -28,7 +30,7 @@ Fourteen public methods return another `Effect`: `succeed`, `fail`, `die`,
 `with_span`, `zip_par`, `race`, `bracket`, and `provide`. One method executes
 the description.
 
-[The program is a value until Effect::run](docs/charts/program-is-a-value.html)
+![The program is a value until Effect::run](docs/charts/program-is-a-value.png)
 
 ## A defect is not retried
 
@@ -40,7 +42,7 @@ cancellation from a parent scope.
 retry left runs twice. A defect with three retries left runs once. `catch_fail`
 handles `Exit::Fail` and lets `Exit::Die` through.
 
-[A defect is not retried](docs/charts/retry-skips-defects.html)
+![A defect is not retried](docs/charts/retry-skips-defects.png)
 
 ## The log decides the next transition
 
@@ -54,10 +56,11 @@ If two components enable the same key, projection returns
 `ActorError::DuplicateTransition` before either effect body runs.
 
 A text turn stops after `model.turn`. A confirmation thread grows through the
-answer and the tool. A question thread grows through `question.answered`.
+answer and the tool. A question thread grows through `question.answered` and
+lands on the second model row, not on a tool result.
 A duplicate key stops at the ingress fact.
 
-[The log decides the next transition](docs/charts/log-fold.html)
+![The log decides the next transition](docs/charts/log-fold.png)
 
 ## Both waits end on a fact
 
@@ -71,7 +74,7 @@ After `confirmation.answered` with `approved: true`, the tool transition
 runs once. After `question.answered`, the next model turn runs once. A denial
 completes the turn without calling the tool.
 
-[Both waits end on a fact, not a timer](docs/charts/park-until-fact.html)
+![Both waits end on a fact, not a timer](docs/charts/park-until-fact.png)
 
 ## What else the same rules cover
 
