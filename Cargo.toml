@@ -1,0 +1,19 @@
+[package]
+name = "a3s-effect"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Effect-style actor runtime for projecting an A3S Code harness from an immutable event log"
+publish = false
+rust-version = "1.85"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
