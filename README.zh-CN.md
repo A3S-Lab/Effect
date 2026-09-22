@@ -1,8 +1,8 @@
-# effect
+# a3s-effect
 
 [English](README.md)
 
-`effect` 是 A3S Code harness 的 actor 运行时。它把两件事分开，其余设计都从这里长出来。
+`a3s-effect` 是 A3S Code harness 的 actor 运行时，检出目录是 `packages/effect`。它把两件事分开，其余设计都从这里长出来。
 
 一次转移是一个程序值。它写明成功值、预期错误，以及需要的服务。这份描述本身不会去调用模型、工具或压缩器。[`Effect::run`](src/effect.rs) 才是执行它的边界。
 

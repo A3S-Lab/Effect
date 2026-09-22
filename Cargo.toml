@@ -1,5 +1,5 @@
 [package]
-name = "effect"
+name = "a3s-effect"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"

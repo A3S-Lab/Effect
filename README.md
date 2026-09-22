@@ -1,8 +1,9 @@
-# effect
+# a3s-effect
 
 [中文](README.zh-CN.md)
 
-`effect` is the actor runtime for an A3S Code harness. It keeps two
+`a3s-effect` is the actor runtime for an A3S Code harness. It is checked out
+at `packages/effect`. It keeps two
 ideas separate, and the rest of the crate follows from that split.
 
 A transition is a program value. It names its success, its expected error,

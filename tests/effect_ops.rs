@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use effect::{ActorError, Effect, Exit, Schedule};
+use a3s_effect::{ActorError, Effect, Exit, Schedule};
 
 #[tokio::test]
 async fn constructing_an_effect_does_not_run_it() {
@@ -188,6 +188,6 @@ async fn provide_swaps_the_service_environment() {
 
 #[tokio::test]
 async fn config_is_rejected_before_an_actor_exists() {
-    let error = effect::HarnessConfig::new(1, 10, 0, 1, Vec::new(), Vec::new()).unwrap_err();
+    let error = a3s_effect::HarnessConfig::new(1, 10, 0, 1, Vec::new(), Vec::new()).unwrap_err();
     assert!(matches!(error, ActorError::Config(_)));
 }
