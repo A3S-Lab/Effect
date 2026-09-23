@@ -20,6 +20,8 @@ fn tool(id: &str, name: &str, confirm: bool) -> ModelDecision {
             name: name.to_string(),
             args: serde_json::json!({ "path": "src/lib.rs" }),
             needs_confirmation: confirm,
+            text: None,
+            reasoning: None,
         },
     }
 }
@@ -354,6 +356,7 @@ async fn a_question_stays_parked_with_allow_free_text_until_an_answer_fact() {
                 question_id: "q1".into(),
                 question: "Which module?".into(),
                 allow_free_text: true,
+                options: vec!["scheduler".into()],
             }),
             Ok(text("scheduler")),
         ],

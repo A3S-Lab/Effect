@@ -32,6 +32,14 @@ pub struct ToolCall {
     pub name: String,
     pub args: Value,
     pub needs_confirmation: bool,
+    /// Prose that accompanied the call. The fold does not branch on it.
+    /// Replaying it is what lets the next model call see its own plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Provider reasoning that accompanied the call. The fold does not branch
+    /// on it. Absent on logs written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -47,6 +55,10 @@ pub enum ModelDecision {
         question_id: String,
         question: String,
         allow_free_text: bool,
+        /// Options the host renders after the log is reopened. Absent JSON
+        /// fields decode as an empty list.
+        #[serde(default)]
+        options: Vec<String>,
     },
 }
 
@@ -87,6 +99,9 @@ pub struct HarnessConfig {
     model_attempts: u32,
     system: Vec<String>,
     tools: Vec<ToolSpec>,
+    /// After this many successful tool results in the current turn, the next
+    /// completion request carries an empty tool list. `None` does not cap.
+    tool_round_cap: Option<u32>,
 }
 
 impl HarnessConfig {
@@ -113,7 +128,15 @@ impl HarnessConfig {
             model_attempts,
             system,
             tools,
+            tool_round_cap: None,
         })
+    }
+
+    /// One later completion sees no tools once this many tool results exist.
+    /// The caller does not inject a user message to force that completion.
+    pub fn with_tool_round_cap(mut self, cap: u32) -> Self {
+        self.tool_round_cap = Some(cap);
+        self
     }
 
     pub fn step_limit(&self) -> u32 {
@@ -133,6 +156,7 @@ pub struct PendingQuestion {
     pub question_id: String,
     pub question: String,
     pub allow_free_text: bool,
+    pub options: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,12 +289,14 @@ fn on_model(mut state: SchedulerState, config: &HarnessConfig, payload: &Value) 
             question_id,
             question,
             allow_free_text,
+            options,
         } => SchedulerState {
             phase: CodingPhase::Question,
             pending_question: Some(PendingQuestion {
                 question_id,
                 question,
                 allow_free_text,
+                options,
             }),
             pending_call: None,
             ..state
@@ -330,7 +356,7 @@ fn step(mut state: SchedulerState, fact: &Fact, config: &HarnessConfig) -> Sched
                     cycle: 0,
                     messages: {
                         let mut messages = state.messages.clone();
-                        messages.push(payload.text);
+                        messages.push(format!("user\n{}", payload.text));
                         messages
                     },
                     tool_runs: 0,
@@ -392,7 +418,7 @@ fn step(mut state: SchedulerState, fact: &Fact, config: &HarnessConfig) -> Sched
                     cycle: state.cycle + 1,
                     messages: {
                         let mut messages = state.messages.clone();
-                        messages.push(payload.output);
+                        messages.push(format!("tool\n{}", payload.output));
                         messages
                     },
                     pending_call: None,
@@ -412,7 +438,7 @@ fn step(mut state: SchedulerState, fact: &Fact, config: &HarnessConfig) -> Sched
                     cycle: state.cycle + 1,
                     messages: {
                         let mut messages = state.messages.clone();
-                        messages.push(payload.text);
+                        messages.push(format!("user\n{}", payload.text));
                         messages
                     },
                     pending_question: None,
@@ -463,7 +489,10 @@ fn transitions_of(
 ) -> Vec<Transition<CodingServices>> {
     match state.phase {
         CodingPhase::Compact => {
-            let messages = state.messages.clone();
+            let mut messages = state.messages.clone();
+            if !state.summary.is_empty() {
+                messages.insert(0, state.summary.clone());
+            }
             let turn = state.turn;
             vec![Transition {
                 key: format!("compact:{turn}"),
@@ -481,9 +510,13 @@ fn transitions_of(
             }]
         }
         CodingPhase::Infer => {
+            let tools = match config.tool_round_cap {
+                Some(cap) if state.tool_runs >= cap => Vec::new(),
+                _ => config.tools.clone(),
+            };
             let request = CompletionRequest {
                 system: config.system.clone(),
-                tools: config.tools.clone(),
+                tools,
                 summary: state.summary.clone(),
                 messages: state.messages.clone(),
             };
@@ -495,7 +528,11 @@ fn transitions_of(
                 run: Effect::from_async(move |services: Arc<CodingServices>, _cancel| {
                     let request = request.clone();
                     async move {
-                        let decided = services.completion.complete(request).await?;
+                        let decided = match services.completion.complete(request).await {
+                            Ok(decided) => decided,
+                            Err(ActorError::Defect(message)) => return Err(Exit::Die(message)),
+                            Err(error) => return Err(Exit::Fail(error)),
+                        };
                         Ok(vec![NewFact {
                             kind: "model.turn".into(),
                             key: format!("model:{turn}:{cycle}"),

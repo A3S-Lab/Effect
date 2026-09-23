@@ -15,6 +15,9 @@ pub enum ActorError {
     Schema(String),
     #[error("config: {0}")]
     Config(String),
+    /// A defect. The coding fold does not retry it and does not append a fact.
+    #[error("{0}")]
+    Defect(String),
     #[error("transition {key} failed: {message}")]
     Handler { key: String, message: String },
 }

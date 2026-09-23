@@ -45,6 +45,8 @@ fn tool(id: &str, confirm: bool) -> ModelDecision {
             name: "read".into(),
             args: serde_json::json!({ "path": "src/lib.rs" }),
             needs_confirmation: confirm,
+            text: None,
+            reasoning: None,
         },
     }
 }
@@ -272,6 +274,7 @@ async fn parked_question_keeps_allow_free_text_across_reopen() {
                 question_id: "q1".into(),
                 question: "Which module?".into(),
                 allow_free_text: true,
+                options: vec!["scheduler".into(), "log".into()],
             }),
             Ok(text("scheduler")),
         ],
@@ -310,12 +313,11 @@ async fn parked_question_keeps_allow_free_text_across_reopen() {
     .expect("parked resume");
     assert_eq!(still.steps, 0);
     assert_eq!(still.view.phase, CodingPhase::Question);
-    assert!(
-        still
-            .view
-            .pending_question
-            .expect("question")
-            .allow_free_text
+    let question = still.view.pending_question.expect("question");
+    assert!(question.allow_free_text);
+    assert_eq!(
+        question.options,
+        vec!["scheduler".to_string(), "log".to_string()]
     );
     assert_eq!(session.model_calls.load(Ordering::SeqCst), 1);
     assert_eq!(session.tool_calls.load(Ordering::SeqCst), 0);
