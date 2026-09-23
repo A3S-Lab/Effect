@@ -551,8 +551,10 @@ fn transitions_of(
             let Some(call) = state.pending_call.clone() else {
                 return Vec::new();
             };
+            let turn = state.turn;
+            let cycle = state.cycle;
             vec![Transition {
-                key: format!("tool:{}", call.id),
+                key: format!("tool:{turn}:{cycle}:{}", call.id),
                 run: Effect::from_async(move |services: Arc<CodingServices>, _cancel| {
                     let call = call.clone();
                     async move {
@@ -563,7 +565,7 @@ fn transitions_of(
                         };
                         Ok(vec![NewFact {
                             kind: "tool.result".into(),
-                            key: format!("tool-result:{}", call.id),
+                            key: format!("tool-result:{turn}:{cycle}:{}", call.id),
                             payload: json!({ "toolCallId": call.id, "ok": true, "output": output }),
                         }])
                     }
@@ -575,10 +577,10 @@ fn transitions_of(
                 return Vec::new();
             };
             vec![Transition {
-                key: format!("budget:{}", call.id),
+                key: format!("budget:{}:{}:{}", state.turn, state.cycle, call.id),
                 run: Effect::succeed(vec![NewFact {
                     kind: "budget.denied".into(),
-                    key: format!("budget-denied:{}", call.id),
+                    key: format!("budget-denied:{}:{}:{}", state.turn, state.cycle, call.id),
                     payload: json!({ "toolCallId": call.id }),
                 }]),
             }]
