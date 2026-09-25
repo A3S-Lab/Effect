@@ -89,9 +89,12 @@ These are the same two mechanisms, not extra philosophies.
 | A log line that is not a fact | `parse_fact_json` |
 | A harness that cannot run | `HarnessConfig::new` rejects a zero step limit or zero model attempts |
 
-`coding_actor` mounts three components on one log: instructions, the tool
-catalog, and the scheduler. The scheduler is the fold that enables a model
-turn, a tool call, a compaction, or a budget denial.
+`coding_actor` is sugar for the stock Meta Harness tree: `system`, `tools`,
+`budget`, `compact`, and `infer(scheduler)` on one log. Hosts can also assemble
+those parts with [`compose`](src/compose.rs) (`system`, `tools`, `budget`,
+`compact`, `infer`, `HarnessGraph`). Nested `infer([...])` namespaces child
+transition keys; the stock Infer part keeps an un-prefixed scheduler so
+existing fact-log causes stay stable.
 
 ```rust
 let config = HarnessConfig::new(4, 8_000, 32, 2, vec!["You are a coding harness.".into()], vec![])?;

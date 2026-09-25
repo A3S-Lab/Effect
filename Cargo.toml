@@ -4,8 +4,21 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Effect-style actor runtime for projecting an A3S Code harness from an immutable event log"
-publish = false
+repository = "https://github.com/A3S-Lab/Effect"
+homepage = "https://github.com/A3S-Lab/Effect"
+documentation = "https://docs.rs/a3s-effect"
+readme = "README.md"
+keywords = ["effect", "actor", "agent", "harness", "a3s"]
+categories = ["asynchronous", "development-tools"]
 rust-version = "1.85"
+include = [
+    "src/**/*",
+    "tests/**/*",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "README.zh-CN.md",
+]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

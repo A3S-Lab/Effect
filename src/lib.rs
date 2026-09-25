@@ -13,6 +13,7 @@
 
 pub mod actor;
 pub mod coding;
+pub mod compose;
 pub mod effect;
 pub mod error;
 pub mod exit;
@@ -21,10 +22,14 @@ pub mod log;
 
 pub use actor::{component, ingest, resume, Actor, ErasedComponent, Settlement, Transition};
 pub use coding::{
-    answer_fact, coding_actor, confirm_fact, ingest_coding, merge_coding_view, message_fact,
-    resume_coding, CodingPhase, CodingServices, CodingView, Compactor, Completion,
+    answer_fact, coding_actor, coding_scheduler, confirm_fact, ingest_coding, merge_coding_view,
+    message_fact, resume_coding, CodingPhase, CodingServices, CodingView, Compactor, Completion,
     CompletionRequest, HarnessConfig, ModelDecision, PendingConfirmation, PendingQuestion,
     ToolCall, ToolRunner, ToolSpec,
+};
+pub use compose::{
+    budget, compact, compose_coding_actor, infer, mount, namespace_transitions, system, tools,
+    with_key_namespace, HarnessGraph, HarnessPartId, HarnessView, MetaHarnessSpec,
 };
 pub use effect::{Effect, Schedule, TraceEvent};
 pub use error::ActorError;

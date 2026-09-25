@@ -20,7 +20,8 @@ pub struct Transition<S> {
 }
 
 pub struct ErasedComponent<S, V> {
-    project: Arc<dyn Fn(&[Fact]) -> Result<(V, Vec<Transition<S>>), ActorError> + Send + Sync>,
+    pub(crate) project:
+        Arc<dyn Fn(&[Fact]) -> Result<(V, Vec<Transition<S>>), ActorError> + Send + Sync>,
 }
 
 pub fn component<S, V, St, I, Step, Out>(

@@ -142,6 +142,30 @@ impl HarnessConfig {
     pub fn step_limit(&self) -> u32 {
         self.step_limit
     }
+
+    pub fn budget(&self) -> u32 {
+        self.budget
+    }
+
+    pub fn compact_after_chars(&self) -> usize {
+        self.compact_after_chars
+    }
+
+    pub fn model_attempts(&self) -> u32 {
+        self.model_attempts
+    }
+
+    pub fn system(&self) -> &[String] {
+        &self.system
+    }
+
+    pub fn tools(&self) -> &[ToolSpec] {
+        &self.tools
+    }
+
+    pub fn tool_round_cap(&self) -> Option<u32> {
+        self.tool_round_cap
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -180,10 +204,14 @@ pub struct CodingView {
     pub assistant: Option<String>,
     pub phase: CodingPhase,
     pub schema_error: Option<String>,
+    /// Composed budget policy slot (`budget(...)` part).
+    pub tool_budget: Option<u32>,
+    /// Composed compaction threshold slot (`compact(...)` part).
+    pub compact_after_chars: Option<usize>,
 }
 
 impl CodingView {
-    fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             system: Vec::new(),
             tools: Vec::new(),
@@ -192,6 +220,8 @@ impl CodingView {
             assistant: None,
             phase: CodingPhase::Idle,
             schema_error: None,
+            tool_budget: None,
+            compact_after_chars: None,
         }
     }
 }
@@ -212,6 +242,8 @@ pub fn merge_coding_view(views: Vec<CodingView>) -> CodingView {
             .map(|view| view.phase)
             .unwrap_or(CodingPhase::Idle),
         schema_error: views.iter().find_map(|view| view.schema_error.clone()),
+        tool_budget: views.iter().find_map(|view| view.tool_budget),
+        compact_after_chars: views.iter().find_map(|view| view.compact_after_chars),
     }
 }
 
@@ -591,7 +623,8 @@ fn transitions_of(
     }
 }
 
-fn scheduler(config: HarnessConfig) -> ErasedComponent<CodingServices, CodingView> {
+/// Infer-loop scheduler (model / tool / compact / budget deny phases).
+pub fn coding_scheduler(config: HarnessConfig) -> ErasedComponent<CodingServices, CodingView> {
     let step_config = config.clone();
     let output_config = config;
     component(
@@ -601,45 +634,23 @@ fn scheduler(config: HarnessConfig) -> ErasedComponent<CodingServices, CodingVie
     )
 }
 
-fn instructions(config: &HarnessConfig) -> ErasedComponent<CodingServices, CodingView> {
-    let system = config.system.clone();
-    component(
-        || (),
-        |state, _fact| state,
-        move |_state| {
-            (
-                CodingView {
-                    system: system.clone(),
-                    ..CodingView::empty()
-                },
-                Vec::new(),
-            )
-        },
-    )
-}
-
-fn catalog(config: &HarnessConfig) -> ErasedComponent<CodingServices, CodingView> {
-    let tools = config.tools.clone();
-    component(
-        || (),
-        |state, _fact| state,
-        move |_state| {
-            (
-                CodingView {
-                    tools: tools.clone(),
-                    ..CodingView::empty()
-                },
-                Vec::new(),
-            )
-        },
-    )
-}
-
+/// Stock Meta Harness: `system + tools + budget + compact + infer([scheduler])`.
+///
+/// Equivalent to the pre-composition three-component actor for control
+/// behavior; budget/compact also appear as explicit tree parts.
 pub fn coding_actor(config: HarnessConfig) -> Actor<CodingServices, CodingView> {
-    let system = instructions(&config);
-    let tools = catalog(&config);
-    let schedule = scheduler(config);
-    Actor::new("a3s-code", vec![system, tools, schedule], merge_coding_view)
+    let spec = crate::compose::MetaHarnessSpec {
+        name: "a3s-code",
+        budget: config.budget(),
+        compact_after_chars: config.compact_after_chars(),
+        step_limit: config.step_limit(),
+        model_attempts: config.model_attempts(),
+        system: config.system().to_vec(),
+        tools: config.tools().to_vec(),
+        tool_round_cap: config.tool_round_cap(),
+        parts: Vec::new(),
+    };
+    crate::compose::HarnessGraph::from_spec(spec, || coding_scheduler(config.clone())).into_actor()
 }
 
 pub fn message_fact(key: impl Into<String>, text: impl Into<String>) -> NewFact {

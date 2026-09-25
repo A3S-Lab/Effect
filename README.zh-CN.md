@@ -56,7 +56,11 @@
 | 不是事实的日志行 | `parse_fact_json` |
 | 无法运行的 harness | `HarnessConfig::new` 拒绝步数上限为 0 或模型尝试次数为 0 |
 
-`coding_actor` 在同一份日志上挂三个组件：说明、工具目录、调度器。调度器的折叠会启用模型回合、工具调用、压缩或预算拒绝。
+`coding_actor` 是存量 Meta Harness 树的语法糖：在同一份日志上挂 `system`、
+`tools`、`budget`、`compact` 与 `infer(scheduler)`。宿主也可通过
+[`compose`](src/compose.rs)（`system`、`tools`、`budget`、`compact`、`infer`、
+`HarnessGraph`）自行组装。嵌套的 `infer([...])` 会给子转移键加命名空间；
+存量 Infer 部件不给调度器加前缀，以保持既有 fact-log cause 稳定。
 
 ```rust
 let config = HarnessConfig::new(4, 8_000, 32, 2, vec!["You are a coding harness.".into()], vec![])?;
