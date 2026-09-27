@@ -23,19 +23,25 @@ fn tool(id: &str, name: &str, confirm: bool) -> ModelDecision {
             text: None,
             reasoning: None,
         },
+        also: Vec::new(),
     }
 }
 
 struct ScriptModel {
     decisions: Mutex<Vec<Result<ModelDecision, ActorError>>>,
     calls: Arc<AtomicUsize>,
+    seen: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 impl Completion for ScriptModel {
     fn complete(
         &self,
-        _request: CompletionRequest,
+        request: CompletionRequest,
     ) -> a3s_effect::coding::BoxFuture<Result<ModelDecision, ActorError>> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(request.messages.clone());
         let decision = self
             .decisions
             .lock()
@@ -93,6 +99,7 @@ struct Harness {
     model_calls: Arc<AtomicUsize>,
     tool_calls: Arc<AtomicUsize>,
     compact_calls: Arc<AtomicUsize>,
+    seen: Arc<Mutex<Vec<Vec<String>>>>,
     log: MemoryLog,
     actor: a3s_effect::Actor<CodingServices, a3s_effect::CodingView>,
     limit: u32,
@@ -108,9 +115,11 @@ fn harness(
     let model_calls = Arc::new(AtomicUsize::new(0));
     let tool_calls = Arc::new(AtomicUsize::new(0));
     let compact_calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(Vec::new()));
     let model = ScriptModel {
         decisions: Mutex::new(decisions.into_iter().rev().collect()),
         calls: Arc::clone(&model_calls),
+        seen: Arc::clone(&seen),
     };
     let tools = CountingTools {
         calls: Arc::clone(&tool_calls),
@@ -141,6 +150,7 @@ fn harness(
         model_calls,
         tool_calls,
         compact_calls,
+        seen,
         log: MemoryLog::new(),
         actor: coding_actor(config),
         limit,
@@ -500,6 +510,7 @@ async fn file_log_recovery_runs_a_recorded_tool_request_once() {
         completion: Arc::new(ScriptModel {
             decisions: Mutex::new(vec![Ok(text("after"))]),
             calls: Arc::new(AtomicUsize::new(0)),
+            seen: Arc::new(Mutex::new(Vec::new())),
         }),
         tools: Arc::clone(&tools) as Arc<dyn ToolRunner>,
         compactor: Arc::new(CountingCompactor {
@@ -615,4 +626,197 @@ async fn a_model_turn_that_is_not_a_decision_settles_done() {
     assert_eq!(harness.model_calls.load(Ordering::SeqCst), 0);
     assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 0);
     assert_eq!(settled.log.len(), before.len());
+}
+
+fn plain_call(id: &str, name: &str, path: &str, confirm: bool) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        args: serde_json::json!({ "path": path }),
+        needs_confirmation: confirm,
+        text: None,
+        reasoning: None,
+    }
+}
+
+#[tokio::test]
+async fn one_model_message_runs_every_tool_call() {
+    let harness = harness(
+        vec![
+            Ok(ModelDecision::Tool {
+                call: plain_call("a", "read", "a.rs", false),
+                also: vec![plain_call("b", "read", "b.rs", false)],
+            }),
+            Ok(text("done")),
+        ],
+        4,
+        10_000,
+        1,
+        false,
+    );
+    let settled = send(&harness, "m1", "read both").await;
+    assert_eq!(settled.view.assistant.as_deref(), Some("done"));
+    assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 2);
+    let stored = harness.log.read("thread-1").unwrap();
+    let ids: Vec<_> = stored
+        .iter()
+        .filter(|fact| fact.kind == "tool.result")
+        .filter_map(|fact| fact.payload.get("toolCallId").and_then(|id| id.as_str()))
+        .collect();
+    assert_eq!(ids, vec!["a", "b"]);
+}
+
+#[tokio::test]
+async fn a_later_call_that_needs_confirmation_stays_parked() {
+    let harness = harness(
+        vec![Ok(ModelDecision::Tool {
+            call: plain_call("a", "read", "a.rs", false),
+            also: vec![plain_call("b", "read", "b.rs", true)],
+        })],
+        4,
+        10_000,
+        1,
+        false,
+    );
+    let parked = send(&harness, "m1", "read both").await;
+    assert_eq!(parked.view.phase, CodingPhase::Confirm);
+    assert_eq!(
+        parked
+            .view
+            .pending_confirmation
+            .as_ref()
+            .map(|item| item.tool_call_id.as_str()),
+        Some("b")
+    );
+    assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn denying_a_parked_call_keeps_the_later_call() {
+    let harness = harness(
+        vec![
+            Ok(ModelDecision::Tool {
+                call: plain_call("a", "read", "a.rs", true),
+                also: vec![plain_call("b", "read", "b.rs", false)],
+            }),
+            Ok(text("done")),
+        ],
+        4,
+        10_000,
+        1,
+        false,
+    );
+    let parked = send(&harness, "m1", "read both").await;
+    assert_eq!(parked.view.phase, CodingPhase::Confirm);
+    assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 0);
+    let settled = a3s_effect::ingest_coding(
+        &harness.actor,
+        &harness.log,
+        Arc::clone(&harness.services),
+        "thread-1",
+        confirm_fact("c1", "a", false),
+        harness.limit,
+    )
+    .await
+    .expect("deny");
+    assert_eq!(settled.view.assistant.as_deref(), Some("done"));
+    assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 1);
+    let stored = harness.log.read("thread-1").unwrap();
+    assert!(stored.iter().any(|fact| {
+        fact.kind == "tool.result"
+            && fact.payload.get("toolCallId").and_then(|id| id.as_str()) == Some("b")
+    }));
+    let seen = harness
+        .seen
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let continued = seen.last().expect("later model step");
+    assert!(
+        continued.iter().any(|line| line == "tool-error\ndenied"),
+        "denial stays in the next prompt: {continued:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_retryable_model_failure_waits_and_a_defect_does_not() {
+    let mut config = HarnessConfig::new(
+        2,
+        10_000,
+        16,
+        2,
+        vec!["You are a coding harness.".into()],
+        vec![ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+        }],
+    )
+    .expect("config")
+    .with_model_retry_delay(std::time::Duration::from_millis(40));
+    let limit = config.step_limit();
+    let model_calls = Arc::new(AtomicUsize::new(0));
+    let model = ScriptModel {
+        decisions: Mutex::new(
+            vec![Err(ActorError::Config("m".into())); 2]
+                .into_iter()
+                .rev()
+                .collect(),
+        ),
+        calls: Arc::clone(&model_calls),
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let services = Arc::new(CodingServices {
+        completion: Arc::new(model),
+        tools: Arc::new(CountingTools {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail_first: AtomicUsize::new(0),
+        }),
+        compactor: Arc::new(CountingCompactor {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+    });
+    let started = tokio::time::Instant::now();
+    let error = a3s_effect::ingest_coding(
+        &coding_actor(config.clone()),
+        &MemoryLog::new(),
+        Arc::clone(&services),
+        "thread-1",
+        message_fact("m1", "hi"),
+        limit,
+    )
+    .await;
+    assert!(matches!(error, Err(Exit::Fail(ActorError::Config(_)))));
+    assert_eq!(model_calls.load(Ordering::SeqCst), 2);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(30));
+
+    config = config.with_model_retry_delay(std::time::Duration::from_millis(200));
+    let defect_calls = Arc::new(AtomicUsize::new(0));
+    let defect = ScriptModel {
+        decisions: Mutex::new(vec![Err(ActorError::Defect("quota".into()))]),
+        calls: Arc::clone(&defect_calls),
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let services = Arc::new(CodingServices {
+        completion: Arc::new(defect),
+        tools: Arc::new(CountingTools {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail_first: AtomicUsize::new(0),
+        }),
+        compactor: Arc::new(CountingCompactor {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+    });
+    let started = tokio::time::Instant::now();
+    let error = a3s_effect::ingest_coding(
+        &coding_actor(config),
+        &MemoryLog::new(),
+        services,
+        "thread-1",
+        message_fact("m1", "hi"),
+        limit,
+    )
+    .await;
+    assert!(matches!(error, Err(Exit::Die(message)) if message == "quota"));
+    assert_eq!(defect_calls.load(Ordering::SeqCst), 1);
+    assert!(started.elapsed() < std::time::Duration::from_millis(150));
 }

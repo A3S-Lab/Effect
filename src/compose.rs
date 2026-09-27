@@ -1,7 +1,7 @@
 //! Meta Harness composition: mount Moore components on one fact log.
 //!
 //! Hosts assemble `system`, `tools`, `budget`, `compact`, and `infer([...])`
-//! the way Tardigrade mounts `components: [...]`. The product default remains
+//! via an ordered `components: [...]` list. The product default remains
 //! [`coding_actor`](crate::coding::coding_actor), which is sugar for the stock
 //! tree. Nested `infer` mounts namespace child transition keys so siblings
 //! cannot collide (`DuplicateTransition`). The stock Infer part mounts the
@@ -85,7 +85,7 @@ where
     }
 }
 
-/// Tardigrade-style nested `infer([...])` with a key-space prefix.
+/// Nested `infer([...])` with a key-space prefix.
 ///
 /// Use for host-authored subtrees. The stock Meta Harness Infer part mounts
 /// the scheduler without this prefix so persisted cause keys stay stable.

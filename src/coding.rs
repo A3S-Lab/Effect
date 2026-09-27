@@ -50,6 +50,9 @@ pub enum ModelDecision {
     },
     Tool {
         call: ToolCall,
+        /// Further calls from the same model message. Empty on older logs.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        also: Vec<ToolCall>,
     },
     Question {
         question_id: String,
@@ -72,10 +75,23 @@ pub struct CompletionRequest {
 
 pub trait Completion: Send + Sync {
     fn complete(&self, request: CompletionRequest) -> BoxFuture<Result<ModelDecision, ActorError>>;
+
+    /// Provider-reported prompt tokens for the completion that just returned.
+    /// `None` when the provider omitted usage. The infer transition copies this
+    /// onto the `model.turn` fact so a later fold can compact from it.
+    fn reported_prompt_tokens(&self) -> Option<u64> {
+        None
+    }
 }
 
 pub trait ToolRunner: Send + Sync {
     fn run(&self, call: ToolCall) -> BoxFuture<Result<Value, ActorError>>;
+
+    /// True when every call in the batch can run at the same time.
+    /// The default keeps calls in order, one after another.
+    fn can_parallelize(&self, _calls: &[ToolCall]) -> bool {
+        false
+    }
 }
 
 pub trait Compactor: Send + Sync {
@@ -102,6 +118,19 @@ pub struct HarnessConfig {
     /// After this many successful tool results in the current turn, the next
     /// completion request carries an empty tool list. `None` does not cap.
     tool_round_cap: Option<u32>,
+    /// Compact when the previous model turn reported at least this many prompt
+    /// tokens. `None` keeps the character threshold.
+    compact_after_tokens: Option<u64>,
+    /// Recent transcript to keep verbatim, in estimated tokens. `0` keeps only
+    /// the latest tool call and its result.
+    compact_keep_tokens: usize,
+    /// After this many identical tool calls, the next one is not executed.
+    /// The model receives a tool result that asks it to change approach.
+    /// `None` does not check.
+    duplicate_threshold: Option<u32>,
+    /// Wait this long before replaying a failed model call. `ZERO` retries
+    /// immediately. The host sets a jittered delay for provider failures.
+    model_retry_delay: std::time::Duration,
 }
 
 impl HarnessConfig {
@@ -129,7 +158,39 @@ impl HarnessConfig {
             system,
             tools,
             tool_round_cap: None,
+            compact_after_tokens: None,
+            compact_keep_tokens: 0,
+            duplicate_threshold: None,
+            model_retry_delay: std::time::Duration::ZERO,
         })
+    }
+
+    /// Compact from provider prompt tokens and keep a recent token budget.
+    /// The character threshold no longer fires on this config.
+    pub fn with_token_compact(mut self, after_tokens: u64, keep_tokens: usize) -> Self {
+        self.compact_after_tokens = Some(after_tokens.max(1));
+        self.compact_keep_tokens = keep_tokens.max(1);
+        self.compact_after_chars = usize::MAX;
+        self
+    }
+
+    /// Keep this many estimated tokens of recent transcript when a character
+    /// threshold fires. `0` keeps only the latest tool pair.
+    pub fn with_keep_tokens(mut self, keep_tokens: usize) -> Self {
+        self.compact_keep_tokens = keep_tokens;
+        self
+    }
+
+    /// Soft stop for an identical tool call. The call is not executed.
+    pub fn with_duplicate_threshold(mut self, threshold: u32) -> Self {
+        self.duplicate_threshold = Some(threshold);
+        self
+    }
+
+    /// Delay before a failed model call is tried again.
+    pub fn with_model_retry_delay(mut self, delay: std::time::Duration) -> Self {
+        self.model_retry_delay = delay;
+        self
     }
 
     /// One later completion sees no tools once this many tool results exist.
@@ -165,6 +226,10 @@ impl HarnessConfig {
 
     pub fn tool_round_cap(&self) -> Option<u32> {
         self.tool_round_cap
+    }
+
+    pub fn model_retry_delay(&self) -> std::time::Duration {
+        self.model_retry_delay
     }
 }
 
@@ -258,8 +323,11 @@ struct SchedulerState {
     compacted_turn: u64,
     assistant: Option<String>,
     pending_call: Option<ToolCall>,
+    /// Calls from the same model message that have not run yet.
+    queued: Vec<ToolCall>,
     pending_question: Option<PendingQuestion>,
     schema_error: Option<String>,
+    prompt_tokens: Option<u64>,
 }
 
 impl SchedulerState {
@@ -274,8 +342,10 @@ impl SchedulerState {
             compacted_turn: 0,
             assistant: None,
             pending_call: None,
+            queued: Vec::new(),
             pending_question: None,
             schema_error: None,
+            prompt_tokens: None,
         }
     }
 
@@ -285,8 +355,15 @@ impl SchedulerState {
 }
 
 fn after_input(state: SchedulerState, config: &HarnessConfig) -> SchedulerState {
-    let needs_compact =
-        state.size() >= config.compact_after_chars && state.compacted_turn != state.turn;
+    let (prefix, _) = split_compact_tail(&state.messages, config.compact_keep_tokens);
+    let token_pressure = config
+        .compact_after_tokens
+        .is_some_and(|limit| state.prompt_tokens.is_some_and(|used| used >= limit));
+    let char_pressure =
+        config.compact_after_tokens.is_none() && state.size() >= config.compact_after_chars;
+    let needs_compact = !prefix.is_empty()
+        && (token_pressure || char_pressure)
+        && state.compacted_turn != state.turn;
     SchedulerState {
         phase: if needs_compact {
             CodingPhase::Compact
@@ -300,7 +377,16 @@ fn after_input(state: SchedulerState, config: &HarnessConfig) -> SchedulerState 
     }
 }
 
+fn prompt_tokens_of(payload: &Value) -> Option<u64> {
+    payload
+        .get("prompt_tokens")
+        .and_then(|value| value.as_u64())
+        .filter(|tokens| *tokens > 0)
+}
+
 fn on_model(mut state: SchedulerState, config: &HarnessConfig, payload: &Value) -> SchedulerState {
+    let prompt_tokens = prompt_tokens_of(payload).or(state.prompt_tokens);
+    state.prompt_tokens = prompt_tokens;
     let decided = match serde_json::from_value::<ModelDecision>(payload.clone()) {
         Ok(decided) => decided,
         Err(error) => {
@@ -333,24 +419,44 @@ fn on_model(mut state: SchedulerState, config: &HarnessConfig, payload: &Value) 
             pending_call: None,
             ..state
         },
-        ModelDecision::Tool { call } => {
-            if state.tool_runs >= config.budget {
+        ModelDecision::Tool { call, also } => {
+            let mut calls = Vec::with_capacity(1 + also.len());
+            calls.push(call);
+            calls.extend(also);
+            let mut messages = state.messages.clone();
+            for call in &calls {
+                messages.push(format!("assistant\ntool {}\n{}", call.name, call.args));
+            }
+            let Some(first) = calls.first().cloned() else {
+                return SchedulerState {
+                    phase: CodingPhase::Done,
+                    schema_error: Some("model tool decision had no call".into()),
+                    ..state
+                };
+            };
+            let queued = calls.into_iter().skip(1).collect();
+            let recorded = SchedulerState {
+                messages,
+                queued,
+                ..state
+            };
+            if recorded.tool_runs >= config.budget {
                 SchedulerState {
                     phase: CodingPhase::Deny,
-                    pending_call: Some(call),
-                    ..state
+                    pending_call: Some(first),
+                    ..recorded
                 }
-            } else if call.needs_confirmation {
+            } else if first.needs_confirmation {
                 SchedulerState {
                     phase: CodingPhase::Confirm,
-                    pending_call: Some(call),
-                    ..state
+                    pending_call: Some(first),
+                    ..recorded
                 }
             } else {
                 SchedulerState {
                     phase: CodingPhase::Tool,
-                    pending_call: Some(call),
-                    ..state
+                    pending_call: Some(first),
+                    ..recorded
                 }
             }
         }
@@ -365,6 +471,112 @@ struct TextPayload {
 #[derive(Deserialize)]
 struct SummaryPayload {
     summary: String,
+    #[serde(default)]
+    kept: Vec<String>,
+}
+
+fn estimate_tokens(text: &str) -> usize {
+    text.len().div_ceil(4).max(1)
+}
+
+fn is_tool_result_line(message: &str) -> bool {
+    message.starts_with("tool\n") || message.starts_with("tool-error\n")
+}
+
+fn tool_result_line(ok: bool, output: &str) -> String {
+    if ok {
+        format!("tool\n{output}")
+    } else {
+        format!("tool-error\n{output}")
+    }
+}
+
+fn promote_queued(mut state: SchedulerState) -> SchedulerState {
+    if state.queued.is_empty() {
+        state.pending_call = None;
+        return state;
+    }
+    let next = state.queued.remove(0);
+    state.phase = if next.needs_confirmation {
+        CodingPhase::Confirm
+    } else {
+        CodingPhase::Tool
+    };
+    state.pending_call = Some(next);
+    state.pending_question = None;
+    state
+}
+
+/// Older lines are summarized. `keep_tokens == 0` retains only the newest tool
+/// call and its result. A positive budget walks backward by tool pairs and
+/// keeps every recent pair that still fits, always including the newest pair.
+fn split_compact_tail(messages: &[String], keep_tokens: usize) -> (Vec<String>, Vec<String>) {
+    if messages.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    if keep_tokens == 0 {
+        let Some(tool_at) = messages
+            .iter()
+            .rposition(|message| is_tool_result_line(message))
+        else {
+            return (messages.to_vec(), Vec::new());
+        };
+        let start = if tool_at > 0 && messages[tool_at - 1].starts_with("assistant\ntool ") {
+            tool_at - 1
+        } else {
+            tool_at
+        };
+        return (messages[..start].to_vec(), messages[start..].to_vec());
+    }
+    let mut units = Vec::new();
+    let mut index = 0;
+    while index < messages.len() {
+        if index + 1 < messages.len()
+            && messages[index].starts_with("assistant\ntool ")
+            && is_tool_result_line(&messages[index + 1])
+        {
+            units.push((index, index + 2));
+            index += 2;
+        } else {
+            units.push((index, index + 1));
+            index += 1;
+        }
+    }
+    let mut start_unit = units.len() - 1;
+    let mut used = messages[units[start_unit].0..units[start_unit].1]
+        .iter()
+        .map(|line| estimate_tokens(line))
+        .sum::<usize>();
+    while start_unit > 0 {
+        let previous = start_unit - 1;
+        let extra = messages[units[previous].0..units[previous].1]
+            .iter()
+            .map(|line| estimate_tokens(line))
+            .sum::<usize>();
+        if used.saturating_add(extra) > keep_tokens {
+            break;
+        }
+        used = used.saturating_add(extra);
+        start_unit = previous;
+    }
+    let start = units[start_unit].0;
+    (messages[..start].to_vec(), messages[start..].to_vec())
+}
+
+fn duplicate_nudge(messages: &[String], call: &ToolCall, threshold: Option<u32>) -> Option<String> {
+    let threshold = threshold.filter(|value| *value > 0)?;
+    let line = format!("assistant\ntool {}\n{}", call.name, call.args);
+    let count = messages
+        .iter()
+        .filter(|message| message.as_str() == line)
+        .count();
+    if count <= threshold as usize {
+        return None;
+    }
+    Some(format!(
+        "Tool '{}' has been called {} times with identical arguments. Change your approach instead of repeating this call.",
+        call.name, count
+    ))
 }
 
 #[derive(Deserialize)]
@@ -377,6 +589,10 @@ struct ConfirmationPayload {
 struct ToolResultPayload {
     ok: bool,
     output: String,
+    /// When set, this result counts toward the tool ceiling even if `ok` is false.
+    /// Absent logs count only successful results, which is the older behavior.
+    #[serde(default, rename = "countRun")]
+    count_run: Option<bool>,
 }
 
 fn step(mut state: SchedulerState, fact: &Fact, config: &HarnessConfig) -> SchedulerState {
@@ -407,7 +623,7 @@ fn step(mut state: SchedulerState, fact: &Fact, config: &HarnessConfig) -> Sched
                 summary: payload.summary,
                 compacted_turn: state.turn,
                 phase: CodingPhase::Infer,
-                messages: Vec::new(),
+                messages: payload.kept,
                 ..state
             },
             Err(error) => {
@@ -429,12 +645,29 @@ fn step(mut state: SchedulerState, fact: &Fact, config: &HarnessConfig) -> Sched
                         ..state
                     }
                 }
-                Ok(payload) if payload.tool_call_id == call.id => SchedulerState {
-                    phase: CodingPhase::Done,
-                    assistant: Some("denied".into()),
-                    pending_call: None,
-                    ..state
-                },
+                Ok(payload) if payload.tool_call_id == call.id => {
+                    if state.queued.is_empty() {
+                        SchedulerState {
+                            phase: CodingPhase::Done,
+                            assistant: Some("denied".into()),
+                            pending_call: None,
+                            ..state
+                        }
+                    } else {
+                        let mut continued = SchedulerState {
+                            cycle: state.cycle + 1,
+                            messages: {
+                                let mut messages = state.messages.clone();
+                                messages.push(tool_result_line(false, "denied"));
+                                messages
+                            },
+                            tool_runs: state.tool_runs.saturating_add(1),
+                            ..state
+                        };
+                        continued = promote_queued(continued);
+                        continued
+                    }
+                }
                 Ok(_) => state,
                 Err(error) => {
                     state.schema_error = Some(error.to_string());
@@ -444,20 +677,25 @@ fn step(mut state: SchedulerState, fact: &Fact, config: &HarnessConfig) -> Sched
             }
         }
         "tool.result" => match serde_json::from_value::<ToolResultPayload>(fact.payload.clone()) {
-            Ok(payload) => after_input(
-                SchedulerState {
-                    tool_runs: state.tool_runs + u32::from(payload.ok),
+            Ok(payload) => {
+                let counts = payload.count_run.unwrap_or(payload.ok);
+                let folded = SchedulerState {
+                    tool_runs: state.tool_runs + u32::from(counts),
                     cycle: state.cycle + 1,
                     messages: {
                         let mut messages = state.messages.clone();
-                        messages.push(format!("tool\n{}", payload.output));
+                        messages.push(tool_result_line(payload.ok, &payload.output));
                         messages
                     },
-                    pending_call: None,
                     ..state
-                },
-                config,
-            ),
+                };
+                let folded = promote_queued(folded);
+                if folded.pending_call.is_none() {
+                    after_input(folded, config)
+                } else {
+                    folded
+                }
+            }
             Err(error) => {
                 state.schema_error = Some(error.to_string());
                 state.phase = CodingPhase::Done;
@@ -488,6 +726,7 @@ fn step(mut state: SchedulerState, fact: &Fact, config: &HarnessConfig) -> Sched
             phase: CodingPhase::Done,
             assistant: Some("budget".into()),
             pending_call: None,
+            queued: Vec::new(),
             ..state
         },
         _ => state,
@@ -521,21 +760,23 @@ fn transitions_of(
 ) -> Vec<Transition<CodingServices>> {
     match state.phase {
         CodingPhase::Compact => {
-            let mut messages = state.messages.clone();
+            let (prefix, kept) = split_compact_tail(&state.messages, config.compact_keep_tokens);
+            let mut to_summarize = prefix;
             if !state.summary.is_empty() {
-                messages.insert(0, state.summary.clone());
+                to_summarize.insert(0, state.summary.clone());
             }
             let turn = state.turn;
             vec![Transition {
                 key: format!("compact:{turn}"),
                 run: Effect::from_async(move |services: Arc<CodingServices>, _cancel| {
-                    let messages = messages.clone();
+                    let to_summarize = to_summarize.clone();
+                    let kept = kept.clone();
                     async move {
-                        let summary = services.compactor.compact(&messages).await?;
+                        let summary = services.compactor.compact(&to_summarize).await?;
                         Ok(vec![NewFact {
                             kind: "compaction.done".into(),
                             key: format!("compaction:{turn}"),
-                            payload: json!({ "summary": summary }),
+                            payload: json!({ "summary": summary, "kept": kept }),
                         }])
                     }
                 }),
@@ -555,6 +796,7 @@ fn transitions_of(
             let turn = state.turn;
             let cycle = state.cycle;
             let attempts = config.model_attempts;
+            let retry_delay = config.model_retry_delay;
             vec![Transition {
                 key: format!("infer:{turn}:{cycle}"),
                 run: Effect::from_async(move |services: Arc<CodingServices>, _cancel| {
@@ -565,17 +807,21 @@ fn transitions_of(
                             Err(ActorError::Defect(message)) => return Err(Exit::Die(message)),
                             Err(error) => return Err(Exit::Fail(error)),
                         };
+                        let mut payload = serde_json::to_value(&decided)
+                            .map_err(|error| Exit::Die(error.to_string()))?;
+                        if let Some(tokens) = services.completion.reported_prompt_tokens() {
+                            payload["prompt_tokens"] = json!(tokens);
+                        }
                         Ok(vec![NewFact {
                             kind: "model.turn".into(),
                             key: format!("model:{turn}:{cycle}"),
-                            payload: serde_json::to_value(&decided)
-                                .map_err(|error| Exit::Die(error.to_string()))?,
+                            payload,
                         }])
                     }
                 })
                 .retry(Schedule {
                     remaining: attempts.saturating_sub(1),
-                    delay: std::time::Duration::ZERO,
+                    delay: retry_delay,
                 }),
             }]
         }
@@ -583,23 +829,23 @@ fn transitions_of(
             let Some(call) = state.pending_call.clone() else {
                 return Vec::new();
             };
+            let batch = ready_tool_batch(&call, &state.queued);
             let turn = state.turn;
             let cycle = state.cycle;
+            let messages = state.messages.clone();
+            let threshold = config.duplicate_threshold;
+            let key = batch
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>()
+                .join("+");
             vec![Transition {
-                key: format!("tool:{turn}:{cycle}:{}", call.id),
+                key: format!("tool:{turn}:{cycle}:{key}"),
                 run: Effect::from_async(move |services: Arc<CodingServices>, _cancel| {
-                    let call = call.clone();
+                    let batch = batch.clone();
+                    let messages = messages.clone();
                     async move {
-                        let output = services.tools.run(call.clone()).await?;
-                        let output = match output {
-                            Value::String(text) => text,
-                            other => other.to_string(),
-                        };
-                        Ok(vec![NewFact {
-                            kind: "tool.result".into(),
-                            key: format!("tool-result:{turn}:{cycle}:{}", call.id),
-                            payload: json!({ "toolCallId": call.id, "ok": true, "output": output }),
-                        }])
+                        run_tool_batch(services, batch, &messages, threshold, turn, cycle).await
                     }
                 }),
             }]
@@ -621,6 +867,112 @@ fn transitions_of(
             Vec::new()
         }
     }
+}
+
+fn ready_tool_batch(pending: &ToolCall, queued: &[ToolCall]) -> Vec<ToolCall> {
+    let mut batch = vec![pending.clone()];
+    for call in queued {
+        if call.needs_confirmation {
+            break;
+        }
+        batch.push(call.clone());
+    }
+    batch
+}
+
+fn tool_output_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn tool_result_fact(
+    turn: u64,
+    cycle: u64,
+    id: &str,
+    ok: bool,
+    output: String,
+    count_run: bool,
+) -> NewFact {
+    let mut payload = json!({ "toolCallId": id, "ok": ok, "output": output });
+    if count_run {
+        payload["countRun"] = json!(true);
+    }
+    NewFact {
+        kind: "tool.result".into(),
+        key: format!("tool-result:{turn}:{cycle}:{id}"),
+        payload,
+    }
+}
+
+async fn run_tool_batch(
+    services: Arc<CodingServices>,
+    batch: Vec<ToolCall>,
+    messages: &[String],
+    threshold: Option<u32>,
+    turn: u64,
+    cycle: u64,
+) -> Result<Vec<NewFact>, Exit<ActorError>> {
+    let mut nudges = Vec::with_capacity(batch.len());
+    let mut runnable = Vec::new();
+    for call in &batch {
+        if let Some(nudge) = duplicate_nudge(messages, call, threshold) {
+            nudges.push(Some(nudge));
+        } else {
+            nudges.push(None);
+            runnable.push(call.clone());
+        }
+    }
+    let outputs = if runnable.len() > 1 && services.tools.can_parallelize(&runnable) {
+        run_parallel(&services.tools, runnable).await?
+    } else {
+        let mut outputs = Vec::with_capacity(runnable.len());
+        for call in runnable {
+            outputs.push(services.tools.run(call).await.map_err(Exit::Fail)?);
+        }
+        outputs
+    };
+    let mut ran = outputs.into_iter();
+    let mut facts = Vec::with_capacity(batch.len());
+    for (call, nudge) in batch.iter().zip(nudges) {
+        if let Some(nudge) = nudge {
+            facts.push(tool_result_fact(turn, cycle, &call.id, false, nudge, true));
+            continue;
+        }
+        let output = ran
+            .next()
+            .ok_or_else(|| Exit::Die("tool batch lost a result".into()))?;
+        facts.push(tool_result_fact(
+            turn,
+            cycle,
+            &call.id,
+            true,
+            tool_output_text(&output),
+            false,
+        ));
+    }
+    Ok(facts)
+}
+
+async fn run_parallel(
+    tools: &Arc<dyn ToolRunner>,
+    calls: Vec<ToolCall>,
+) -> Result<Vec<Value>, Exit<ActorError>> {
+    let mut set = tokio::task::JoinSet::new();
+    for (index, call) in calls.into_iter().enumerate() {
+        let tools = Arc::clone(tools);
+        set.spawn(async move { (index, tools.run(call).await) });
+    }
+    let mut indexed = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        indexed.push(joined.map_err(|error| Exit::Die(error.to_string()))?);
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    indexed
+        .into_iter()
+        .map(|(_, result)| result.map_err(Exit::Fail))
+        .collect()
 }
 
 /// Infer-loop scheduler (model / tool / compact / budget deny phases).

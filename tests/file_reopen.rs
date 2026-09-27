@@ -48,6 +48,7 @@ fn tool(id: &str, confirm: bool) -> ModelDecision {
             text: None,
             reasoning: None,
         },
+        also: Vec::new(),
     }
 }
 
