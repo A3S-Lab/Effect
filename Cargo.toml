@@ -1,6 +1,6 @@
 [package]
 name = "a3s-effect"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Effect-style actor runtime for projecting an A3S Code harness from an immutable event log"
