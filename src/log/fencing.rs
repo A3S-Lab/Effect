@@ -1,7 +1,7 @@
 //! Original log resource fences. They carry no Goal, execution or permission state.
 
 use super::{
-    restrict_handle_permissions, same_generation, storage_error, valid_thread, validate_regular,
+    restrict_file_permissions, same_generation, storage_error, valid_thread, validate_regular,
     FileLog,
 };
 use crate::ActorError;
@@ -167,7 +167,7 @@ impl FileLog {
             same_generation(&before, &metadata)?;
         }
         let file = file.into_std();
-        restrict_handle_permissions(&file, false)?;
+        restrict_file_permissions(&file)?;
         fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
             if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
                 ActorError::LogBusy

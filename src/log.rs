@@ -190,11 +190,11 @@ impl FileLog {
     /// activation constructor does not create a directory or resolve an
     /// ambient path. It tightens permissions through the handle on Unix.
     pub fn from_directory(dir: Dir) -> Result<Self, ActorError> {
-        let handle = dir.try_clone().map_err(storage_error)?.into_std_file();
-        if !handle.metadata().map_err(storage_error)?.is_dir() {
+        let metadata = dir.dir_metadata().map_err(storage_error)?;
+        if !metadata.is_dir() {
             return Err(storage_error("fact log root must be a directory"));
         }
-        restrict_handle_permissions(&handle, true)?;
+        restrict_directory_permissions(&dir, &metadata)?;
         Ok(Self {
             dir,
             lock: Mutex::new(()),
@@ -405,7 +405,7 @@ impl LogStore for FileLog {
         };
         // The exact handle used to read/validate is also the append handle.
         // A later path replacement can never redirect this write elsewhere.
-        restrict_handle_permissions(&file.try_clone().map_err(storage_error)?.into_std(), false)?;
+        restrict_file_permissions(&file.try_clone().map_err(storage_error)?.into_std())?;
         file.write_all(&bytes).map_err(storage_error)?;
         file.sync_all().map_err(storage_error)?;
         Ok(next)
@@ -473,19 +473,36 @@ fn storage_error(error: impl std::fmt::Display) -> ActorError {
     ActorError::Schema(error.to_string())
 }
 
-fn restrict_handle_permissions(file: &fs::File, directory: bool) -> Result<(), ActorError> {
+fn restrict_file_permissions(file: &fs::File) -> Result<(), ActorError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = if directory { 0o700 } else { 0o600 };
-        if file.metadata().map_err(storage_error)?.permissions().mode() & 0o777 != mode {
-            file.set_permissions(fs::Permissions::from_mode(mode))
+        if file.metadata().map_err(storage_error)?.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
                 .map_err(storage_error)?;
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = (file, directory);
+        let _ = file;
+    }
+    Ok(())
+}
+
+// Linux opens cap-std directories with O_PATH, where fchmod fails with EBADF;
+// Dir::set_permissions changes the mode through a handle that allows it.
+fn restrict_directory_permissions(dir: &Dir, metadata: &Metadata) -> Result<(), ActorError> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::{Permissions, PermissionsExt};
+        if metadata.permissions().mode() & 0o777 != 0o700 {
+            dir.set_permissions(".", Permissions::from_mode(0o700))
+                .map_err(storage_error)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, metadata);
     }
     Ok(())
 }
