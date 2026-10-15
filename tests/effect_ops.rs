@@ -152,6 +152,37 @@ async fn bracket_releases_on_success_failure_and_cancellation() {
 }
 
 #[tokio::test]
+async fn run_with_cancel_lets_the_waiting_future_observe_the_token() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let seen = Arc::new(AtomicUsize::new(0));
+    let started_run = Arc::clone(&started);
+    let seen_run = Arc::clone(&seen);
+    let effect = Effect::<(), ActorError, ()>::from_async(move |_services, cancel| {
+        let started_run = Arc::clone(&started_run);
+        let seen_run = Arc::clone(&seen_run);
+        async move {
+            started_run.notify_one();
+            cancel.cancelled().await;
+            seen_run.fetch_add(1, Ordering::SeqCst);
+            Err(Exit::Interrupt)
+        }
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_run = cancel.clone();
+    let task = tokio::spawn(async move { effect.run_with_cancel(Arc::new(()), cancel_run).await });
+    tokio::time::timeout(Duration::from_secs(1), started.notified())
+        .await
+        .expect("effect did not start");
+    cancel.cancel();
+    let (result, _) = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("cancel did not finish the effect")
+        .expect("effect task panicked");
+    assert!(matches!(result, Err(Exit::Interrupt)));
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn zip_par_cancels_the_sibling_after_a_failure() {
     let cancelled = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&cancelled);

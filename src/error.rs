@@ -3,6 +3,8 @@ use thiserror::Error;
 /// Expected failures of the actor runtime. Defects use [`crate::Exit::Die`].
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ActorError {
+    #[error("fact log is busy in another instance")]
+    LogBusy,
     #[error("fact key {key} was reused with a different payload")]
     DuplicateFact { key: String },
     #[error("two components enabled transition {key}")]

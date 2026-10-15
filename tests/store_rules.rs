@@ -163,8 +163,8 @@ fn cut_log_digest_changes_with_seq_type_key_cause_and_payload() {
         None,
         serde_json::json!({ "text": "hi" }),
     );
-    let first = cut_log(&[base.clone()]);
-    let second = cut_log(&[base.clone()]);
+    let first = cut_log(std::slice::from_ref(&base));
+    let second = cut_log(std::slice::from_ref(&base));
     assert_eq!(first.digest, second.digest);
     assert_eq!(first.seq, base.seq);
 
@@ -234,7 +234,8 @@ fn spin_actor(calls: Arc<AtomicUsize>) -> Actor<(), ()> {
                                 payload: serde_json::json!({}),
                             }])
                         }
-                    }),
+                    })
+                    .into(),
                 }],
             )
         },

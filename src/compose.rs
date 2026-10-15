@@ -10,7 +10,10 @@
 use std::sync::Arc;
 
 use crate::actor::{component, Actor, ErasedComponent, Transition};
-use crate::coding::{merge_coding_view, CodingServices, CodingView, HarnessConfig, ToolSpec};
+use crate::coding::{
+    merge_coding_view, CodingServices, CodingView, Completion, CompletionRequest, HarnessConfig,
+    ModelDecision, ToolSpec,
+};
 use crate::error::ActorError;
 
 /// Documented merge slots for the coding Meta Harness view.
@@ -225,6 +228,19 @@ impl MetaHarnessSpec {
         Ok(config)
     }
 
+    /// The recipe's fields over a session config. Token compaction, which a
+    /// recipe cannot name, stays from `base`; a character threshold that
+    /// differs from `base` is an explicit choice and replaces it.
+    pub fn into_config_over(self, base: &HarnessConfig) -> Result<HarnessConfig, ActorError> {
+        let keeps_token_compact = self.compact_after_chars == base.compact_after_chars();
+        let config = self.into_config()?;
+        Ok(if keeps_token_compact {
+            config.with_token_compact_of(base)
+        } else {
+            config
+        })
+    }
+
     pub fn resolved_parts(&self) -> Vec<HarnessPartId> {
         if self.parts.is_empty() {
             vec![
@@ -245,8 +261,61 @@ pub fn compose_coding_actor(
     name: &'static str,
     components: Vec<ErasedComponent<CodingServices, HarnessView>>,
 ) -> Actor<CodingServices, HarnessView> {
-    Actor::new(name, components, merge_coding_view)
+    let mounted = mount("", components, merge_coding_view);
+    let bound = ErasedComponent {
+        project: Arc::new(move |facts| {
+            let (view, transitions) = (mounted.project)(facts)?;
+            let system = Arc::new(view.system.clone());
+            let transitions = transitions
+                .into_iter()
+                .map(|transition| {
+                    let system = Arc::clone(&system);
+                    Transition {
+                        key: transition.key,
+                        run: transition
+                            .run
+                            .map_services(move |services: Arc<CodingServices>| {
+                                Arc::new(CodingServices {
+                                    completion: Arc::new(ProjectedCompletion {
+                                        inner: Arc::clone(&services.completion),
+                                        system: Arc::clone(&system),
+                                    }),
+                                    tools: Arc::clone(&services.tools),
+                                    compactor: Arc::clone(&services.compactor),
+                                })
+                            }),
+                    }
+                })
+                .collect();
+            Ok((view, transitions))
+        }),
+    };
+    Actor::new(name, vec![bound], merge_coding_view)
 }
+
+struct ProjectedCompletion {
+    inner: Arc<dyn Completion>,
+    system: Arc<Vec<String>>,
+}
+
+impl Completion for ProjectedCompletion {
+    fn complete(
+        &self,
+        mut request: CompletionRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> crate::coding::BoxFuture<Result<ModelDecision, ActorError>> {
+        request.system = self.system.as_ref().clone();
+        self.inner.complete(request, cancel)
+    }
+
+    fn reported_prompt_tokens(&self) -> Option<u64> {
+        self.inner.reported_prompt_tokens()
+    }
+}
+
+#[cfg(test)]
+#[path = "compose_execution_tests.rs"]
+mod execution_tests;
 
 fn compose_meta_harness_with<F>(
     spec: MetaHarnessSpec,
@@ -325,7 +394,7 @@ mod tests {
             "infer",
             vec![Transition::<()> {
                 key: "compact:1".into(),
-                run: Effect::succeed(Vec::new()),
+                run: Effect::succeed(Vec::new()).into(),
             }],
         );
         assert_eq!(transitions[0].key, "infer/compact:1");
@@ -373,6 +442,31 @@ mod tests {
         };
         let graph = HarnessGraph::from_spec(spec, || coding_scheduler(config.clone()));
         assert_eq!(graph.actor().name, "test");
+    }
+
+    #[test]
+    fn spec_over_a_session_config_keeps_token_compaction_unless_chars_are_explicit() {
+        let base = HarnessConfig::new(4, 100, 8, 1, Vec::new(), Vec::new())
+            .unwrap()
+            .with_token_compact(800, 200);
+        let spec = |chars| MetaHarnessSpec {
+            budget: 4,
+            compact_after_chars: chars,
+            step_limit: 8,
+            model_attempts: 1,
+            ..MetaHarnessSpec::default()
+        };
+        assert_eq!(
+            spec(base.compact_after_chars())
+                .into_config_over(&base)
+                .unwrap(),
+            base
+        );
+        let explicit = spec(5_000).into_config_over(&base).unwrap();
+        assert_eq!(
+            explicit,
+            HarnessConfig::new(4, 5_000, 8, 1, Vec::new(), Vec::new()).unwrap()
+        );
     }
 
     #[test]

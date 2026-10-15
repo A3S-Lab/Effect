@@ -37,6 +37,7 @@ impl Completion for ScriptModel {
     fn complete(
         &self,
         request: CompletionRequest,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> a3s_effect::coding::BoxFuture<Result<ModelDecision, ActorError>> {
         self.seen
             .lock()
@@ -62,6 +63,7 @@ impl ToolRunner for CountingTools {
     fn run(
         &self,
         call: ToolCall,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> a3s_effect::coding::BoxFuture<Result<serde_json::Value, ActorError>> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         let name = call.name;
@@ -260,7 +262,7 @@ async fn an_approved_tool_runs_once_across_resume() {
 }
 
 #[tokio::test]
-async fn a_failed_tool_is_not_recorded_and_resume_runs_it_once() {
+async fn a_failed_tool_records_unknown_and_resume_does_not_repeat_it() {
     let harness = harness(
         vec![Ok(tool("t1", "read", false)), Ok(text("after"))],
         2,
@@ -277,17 +279,18 @@ async fn a_failed_tool_is_not_recorded_and_resume_runs_it_once() {
         harness.limit,
     )
     .await;
-    assert!(matches!(
-        failed,
-        Err(Exit::Fail(ActorError::Handler { .. }))
-    ));
+    let failed = failed.expect("tool failure is retained as Unknown");
+    assert!(failed
+        .log
+        .iter()
+        .any(|fact| fact.kind == "tool.result" && fact.payload["receipt"]["outcome"] == "unknown"));
     assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 1);
     assert!(harness
         .log
         .read("thread-1")
         .unwrap()
         .iter()
-        .all(|fact| fact.kind != "tool.result"));
+        .any(|fact| fact.kind == "tool.prepared"));
 
     let settled = a3s_effect::resume_coding(
         &harness.actor,
@@ -299,7 +302,7 @@ async fn a_failed_tool_is_not_recorded_and_resume_runs_it_once() {
     .await
     .expect("resume");
     assert_eq!(settled.view.assistant.as_deref(), Some("after"));
-    assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         settled
             .log
@@ -318,7 +321,7 @@ async fn a_failed_tool_is_not_recorded_and_resume_runs_it_once() {
     )
     .await
     .expect("second resume");
-    assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(harness.tool_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -356,6 +359,34 @@ async fn compaction_runs_once_before_inference() {
     .await
     .expect("resume");
     assert_eq!(harness.compact_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn pressure_that_returns_within_a_turn_compacts_again_after_a_model_call() {
+    let harness = harness(
+        vec![
+            Ok(tool("t1", "read", false)),
+            Ok(tool("t2", "read", false)),
+            Ok(text("done")),
+        ],
+        4,
+        5,
+        1,
+        false,
+    );
+    let settled = send(&harness, "m1", "hello").await;
+    assert_eq!(settled.view.assistant.as_deref(), Some("done"));
+    let compactions = settled
+        .log
+        .iter()
+        .filter(|fact| fact.kind == "compaction.done")
+        .count();
+    assert_eq!(compactions, harness.compact_calls.load(Ordering::SeqCst));
+    assert!(
+        compactions > 1,
+        "one turn compacted only {compactions} time(s)"
+    );
+    assert!(compactions <= harness.model_calls.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -450,7 +481,8 @@ async fn duplicate_transition_keys_fail_before_any_effect_runs() {
                                 payload: serde_json::json!({}),
                             }])
                         }
-                    }),
+                    })
+                    .into(),
                 }],
             )
         },
@@ -474,7 +506,8 @@ async fn duplicate_transition_keys_fail_before_any_effect_runs() {
                                 payload: serde_json::json!({}),
                             }])
                         }
-                    }),
+                    })
+                    .into(),
                 }],
             )
         },
@@ -498,7 +531,7 @@ async fn duplicate_transition_keys_fail_before_any_effect_runs() {
 }
 
 #[tokio::test]
-async fn file_log_recovery_runs_a_recorded_tool_request_once() {
+async fn file_log_recovery_runs_a_protocol_one_unprepared_call_once() {
     let dir = std::env::temp_dir().join(format!("effect-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let log = FileLog::open(&dir).expect("open");
@@ -526,7 +559,11 @@ async fn file_log_recovery_runs_a_recorded_tool_request_once() {
             NewFact {
                 kind: "model.turn".into(),
                 key: "model:1:0".into(),
-                payload: serde_json::to_value(tool("t1", "read", false)).unwrap(),
+                payload: {
+                    let mut payload = serde_json::to_value(tool("t1", "read", false)).unwrap();
+                    payload["tool_effect_protocol"] = serde_json::json!(1);
+                    payload
+                },
             },
         ],
         None,

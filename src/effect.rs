@@ -65,8 +65,10 @@ impl<S> RunCtx<S> {
 
 /// A description of a program. `A` is the success value, `E` is the expected
 /// error, and `S` is the service environment required to run it.
+type EffectProgram<A, E, S> = dyn Fn(RunCtx<S>) -> BoxFuture<Result<A, Exit<E>>> + Send + Sync;
+
 pub struct Effect<A, E, S> {
-    run: Arc<dyn Fn(RunCtx<S>) -> BoxFuture<Result<A, Exit<E>>> + Send + Sync>,
+    run: Arc<EffectProgram<A, E, S>>,
     _marker: PhantomData<fn() -> (A, E)>,
 }
 
@@ -142,6 +144,23 @@ where
         })
     }
 
+    /// Like [`Self::from_async`], but `f` still runs when the token is already
+    /// cancelled. `f` has to observe the token. A caller that must append a
+    /// fact on cancel uses this. [`Self::from_async`] returns
+    /// [`Exit::Interrupt`] before `f` starts, and dropping that future would
+    /// skip the fact.
+    pub fn from_async_observed<F, Fut>(f: F) -> Self
+    where
+        F: Fn(Arc<S>, CancellationToken) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<A, Exit<E>>> + Send + 'static,
+    {
+        let f = Arc::new(f);
+        Self::new(move |ctx| {
+            let fut = f(Arc::clone(&ctx.services), ctx.cancel.clone());
+            Box::pin(fut)
+        })
+    }
+
     pub fn map<B, F>(&self, f: F) -> Effect<B, E, S>
     where
         B: Send + Sync + 'static,
@@ -195,6 +214,12 @@ where
     }
 
     /// Retry expected failures. Interruption and defects are not retried.
+    ///
+    /// The wrapped effect owns cancellation: an observed effect still runs
+    /// when the token is already cancelled so it can append its interrupt
+    /// facts, and an effect built with [`Self::from_async`] refuses before
+    /// its body starts. Only the backoff sleep between attempts is cut
+    /// short by the token.
     pub fn retry(&self, schedule: Schedule) -> Self
     where
         E: Clone,
@@ -205,9 +230,6 @@ where
             let mut schedule = schedule;
             Box::pin(async move {
                 loop {
-                    if ctx.cancel.is_cancelled() {
-                        return Err(Exit::Interrupt);
-                    }
                     match run(ctx.clone()).await {
                         Ok(value) => return Ok(value),
                         Err(Exit::Fail(_error)) if schedule.remaining > 0 => {
@@ -368,6 +390,25 @@ where
         })
     }
 
+    /// Map the caller's services while preserving cancellation and the trace.
+    pub fn map_services<S2>(
+        self,
+        map: impl Fn(Arc<S2>) -> Arc<S> + Send + Sync + 'static,
+    ) -> Effect<A, E, S2>
+    where
+        S2: Send + Sync + 'static,
+    {
+        let run = self.run;
+        Effect::new(move |ctx| {
+            let mapped = RunCtx {
+                services: map(ctx.services),
+                cancel: ctx.cancel,
+                trace: ctx.trace,
+            };
+            run(mapped)
+        })
+    }
+
     /// Replace the service environment. The resulting program no longer
     /// requires `S`; the caller supplies a different environment at the edge.
     pub fn provide<S2>(self, services: S) -> Effect<A, E, S2>
@@ -389,10 +430,21 @@ where
     }
 
     pub async fn run(self, services: Arc<S>) -> (Result<A, Exit<E>>, Vec<TraceEvent>) {
+        self.run_with_cancel(services, CancellationToken::new())
+            .await
+    }
+
+    /// Run with the caller's token. [`Self::run`] passes a fresh token that
+    /// nothing else cancels.
+    pub async fn run_with_cancel(
+        self,
+        services: Arc<S>,
+        cancel: CancellationToken,
+    ) -> (Result<A, Exit<E>>, Vec<TraceEvent>) {
         let trace = Arc::new(Mutex::new(Vec::new()));
         let ctx = RunCtx {
             services,
-            cancel: CancellationToken::new(),
+            cancel,
             trace: Arc::clone(&trace),
         };
         let result = self.run_in(ctx).await;

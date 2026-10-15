@@ -16,6 +16,7 @@ impl Completion for RecordingModel {
     fn complete(
         &self,
         request: CompletionRequest,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> a3s_effect::coding::BoxFuture<Result<ModelDecision, ActorError>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.tool_counts.lock().unwrap().push(request.tools.len());
@@ -34,6 +35,7 @@ impl ToolRunner for NoTools {
     fn run(
         &self,
         _call: a3s_effect::ToolCall,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> a3s_effect::coding::BoxFuture<Result<serde_json::Value, ActorError>> {
         Box::pin(async { Ok(serde_json::json!("unused")) })
     }

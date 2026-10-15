@@ -61,6 +61,7 @@ impl Completion for ScriptModel {
     fn complete(
         &self,
         _request: CompletionRequest,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> a3s_effect::coding::BoxFuture<Result<ModelDecision, ActorError>> {
         let decision = self
             .decisions
@@ -82,6 +83,7 @@ impl ToolRunner for CountingTools {
     fn run(
         &self,
         call: ToolCall,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> a3s_effect::coding::BoxFuture<Result<serde_json::Value, ActorError>> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         let name = call.name;
@@ -340,7 +342,7 @@ async fn parked_question_keeps_allow_free_text_across_reopen() {
 }
 
 #[tokio::test]
-async fn failed_tool_without_a_result_runs_once_after_reopen() {
+async fn failed_tool_records_unknown_and_is_not_repeated_after_reopen() {
     let session = Session::open(
         "tool-fail",
         vec![Ok(tool("t1", false)), Ok(text("after"))],
@@ -357,13 +359,15 @@ async fn failed_tool_without_a_result_runs_once_after_reopen() {
             LIMIT,
         )
         .await;
-        assert!(matches!(
-            failed,
-            Err(Exit::Fail(ActorError::Handler { .. }))
-        ));
+        let failed = failed.expect("tool failure is retained as Unknown");
+        assert!(failed
+            .log
+            .iter()
+            .any(|fact| fact.kind == "tool.result"
+                && fact.payload["receipt"]["outcome"] == "unknown"));
         let stored = log.read("thread-1").unwrap();
         assert!(stored.iter().any(|fact| fact.kind == "model.turn"));
-        assert!(stored.iter().all(|fact| fact.kind != "tool.result"));
+        assert!(stored.iter().any(|fact| fact.kind == "tool.prepared"));
         assert_eq!(session.tool_calls.load(Ordering::SeqCst), 1);
     }
     {
@@ -376,8 +380,8 @@ async fn failed_tool_without_a_result_runs_once_after_reopen() {
             LIMIT,
         )
         .await
-        .expect("retry tool");
-        assert_eq!(session.tool_calls.load(Ordering::SeqCst), 2);
+        .expect("reuse Unknown result");
+        assert_eq!(session.tool_calls.load(Ordering::SeqCst), 1);
         assert_eq!(session.model_calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             settled
@@ -399,7 +403,7 @@ async fn failed_tool_without_a_result_runs_once_after_reopen() {
     .await
     .expect("third");
     assert_eq!(quiet.steps, 0);
-    assert_eq!(session.tool_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(session.tool_calls.load(Ordering::SeqCst), 1);
     assert_eq!(session.model_calls.load(Ordering::SeqCst), 2);
 }
 
